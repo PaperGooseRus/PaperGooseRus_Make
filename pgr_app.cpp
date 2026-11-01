@@ -2,6 +2,7 @@
 #include <iostream>
 
 #include "gui/gtk_app.hpp"
+#include "core/compiler/compiler.hpp"
 
 /**
  * @brief   Главный класс приложения, управляющий жизненным циклом GUI.
@@ -33,6 +34,10 @@ class pgr_app_t final {
      */
     int run(int argc, char* argv[]) {
         gtk_app_t gtk_app;
+
+        compiler_t compiler;
+        compiler.run(argc, argv);
+
         return gtk_app.run(argc, argv);
     }
 };
