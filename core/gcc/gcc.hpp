@@ -143,24 +143,106 @@ private:
     return error;
   }
 
-  int assembly(void) {
-    std::cout << "GCC start step=\"ASSEMBLY\" ->" << std::endl;
-
+  int assembly(
+    const std::filesystem::path& source_file_path
+  ) {
+    std::cout << "GCC START ASSEMBLY ->" << std::endl;
     gcc_step = gcc_step_t::ASSEMBLY;
 
-    // pass
+    // Проверка существования исходного файла.
+    if (!std::filesystem::is_regular_file(source_file_path)) {
+      std::cerr << "ERROR: SOURCE FILE NOT FOUND: " << source_file_path << std::endl;
 
-    return 0x00;
+      return 0x01;
+    }
+
+    // Формирование директории этапа ASSEMBLY.
+    const auto parent = main_dir_to_build / project / assembly_dir_to_build;
+    std::filesystem::create_directories(parent);
+
+    // Получение абсолютного пути исходного файла.
+    const auto source = std::filesystem::absolute(source_file_path);
+
+    // Формирование имени и полного пути выходного файла.
+    auto filename = source_file_path.filename();
+    filename.replace_extension(".o");
+
+    const auto target = parent / filename;
+
+    // Формирование команды ассемблирования.
+    std::string cmd = "g++ -c -x assembler";
+
+    cmd += " \"";
+    cmd += source.string();
+    cmd += "\" -o \"";
+    cmd += target.string();
+    cmd += "\"";
+
+    // Вывод информации о выполняемой операции.
+    std::cout << "[SOURCE] -> " << source << std::endl;
+    std::cout << "[TARGET] -> " << target << std::endl;
+    std::cout << "[CMD]    -> " << cmd << std::endl;
+
+    // Выполнение команды ассемблирования.
+    const int error = std::system(cmd.c_str());
+
+    // Проверка результата выполнения команды.
+    if (error != 0x00) {
+      std::cerr << "ERROR: ASSEMBLY -> " << error << std::endl;
+    }
+
+    return error;
   }
 
-  int linking(void) {
-    std::cout << "GCC start step=\"LINKING\" ->" << std::endl;
-
+  int linking(
+    const std::filesystem::path& source_file_path
+  ) {
+    std::cout << "GCC START LINKING ->" << std::endl;
     gcc_step = gcc_step_t::LINKING;
 
-    // pass
+    // Проверка существования исходного файла.
+    if (!std::filesystem::is_regular_file(source_file_path)) {
+        std::cerr << "ERROR: SOURCE FILE NOT FOUND: " << source_file_path << std::endl;
 
-    return 0x00;
+        return 0x01;
+    }
+
+    // Формирование директории этапа LINKING.
+    const auto parent = main_dir_to_build / project / linking_dir_to_build;
+
+    std::filesystem::create_directories(parent);
+
+    // Получение абсолютного пути исходного файла.
+    const auto source = std::filesystem::absolute(source_file_path);
+
+    // Формирование имени и полного пути выходного файла.
+    auto filename = source_file_path.filename();
+    filename.replace_extension(".exe");
+    const auto target = parent / filename;
+
+    // Формирование команды компоновки.
+    std::string cmd = "g++";
+
+    cmd += " \"";
+    cmd += source.string();
+    cmd += "\" -o \"";
+    cmd += target.string();
+    cmd += "\"";
+
+    // Вывод информации о выполняемой операции.
+    std::cout << "[SOURCE] -> " << source << std::endl;
+    std::cout << "[TARGET] -> " << target << std::endl;
+    std::cout << "[CMD]    -> " << cmd << std::endl;
+
+    // Выполнение команды компоновки.
+    const int error = std::system(cmd.c_str());
+
+    // Проверка результата выполнения команды.
+    if (error != 0x00) {
+      std::cerr << "ERROR: LINKING -> " << error << std::endl;
+    }
+
+    return error;
   }
 
 public:
@@ -170,41 +252,65 @@ public:
   	std::cout << "GCC constructor.\n"; 
   }
 
-
-int run(int argc, char* argv[]) {
+  int run(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
 
     int result = 0x00;
 
     // Исходный файл проекта.
-    const std::filesystem::path source =
-        "C:/Project/PaperGooseRus_Make/test/main.cpp";
+    const std::filesystem::path source = "C:/Project/PaperGooseRus_Make/test/main.cpp";
+
+    // Формирование общей директории проекта.
+    const auto project_dir = main_dir_to_build / project;
+
+    // Формирование путей промежуточных файлов.
+    auto filename = source.filename();
+
+    filename.replace_extension(".ii");
+    const auto preprocessed_file = project_dir / preprocessing_dir_to_build / filename;
+
+    filename.replace_extension(".s");
+    const auto compiled_file = project_dir / compilation_dir_to_build / filename;
+
+    filename.replace_extension(".o");
+    const auto assembled_file = project_dir / assembly_dir_to_build / filename;
+
+    filename.replace_extension(".exe");
+    const auto executable_file = project_dir / linking_dir_to_build / filename;
 
     // Этап PREPROCESSING.
     result = preprocessing(source);
 
     if (result != 0x00) {
-        return result;
+      return result;
     }
-
-    // Путь к результату PREPROCESSING.
-    const auto preprocessed_file =
-        main_dir_to_build /
-        project /
-        preprocessing_dir_to_build /
-        "main.ii";
 
     // Этап COMPILATION.
     result = compilation(preprocessed_file);
 
     if (result != 0x00) {
-        return result;
+      return result;
     }
 
-    return 0x00;
-}
+    // Этап ASSEMBLY.
+    result = assembly(compiled_file);
 
+    if (result != 0x00) {
+      return result;
+    }
+
+    // Этап LINKING.
+    result = linking(assembled_file);
+
+    if (result != 0x00) {
+      return result;
+    }
+
+    std::cout << "GCC BUILD SUCCESS -> " << executable_file << std::endl;
+
+    return 0x00;
+  }
 
   ~gcc_t() {
     std::cout << "GCC destructor.\n";
