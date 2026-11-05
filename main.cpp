@@ -26,7 +26,13 @@ static int run_cli(int argc, char* argv[]) {
         return loger.execute(command);
       });
       return gcc.run(project);
-    }, settings);
+    }, settings, [](const project_t& project, const std::filesystem::path& build_root,
+                   const gcc_t::build_settings_t& options) {
+      gcc_t gcc;
+      gcc.set_build_dir(build_root);
+      gcc.set_build_settings(options);
+      return gcc.preview(project);
+    });
 
     return cli.run();
   } catch (const std::exception& error) {

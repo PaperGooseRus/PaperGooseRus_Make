@@ -7,6 +7,6 @@ if [[ -f gui/gtk_app.cpp ]]; then
 fi
 mkdir -p build
 g++ -std=c++17 -Wall -Wextra -Wpedantic -pthread -DPGR_WITH_GTK4 \
-  $(pkg-config --cflags gtk4) main.cpp -o build/pgr_gui \
-  $(pkg-config --libs gtk4)
+  $(pkg-config --cflags gtk4 libadwaita-1 gtksourceview-5) main.cpp -o build/pgr_gui \
+  $(pkg-config --libs gtk4 libadwaita-1 gtksourceview-5)
 printf '[OK] build/pgr_gui\n'

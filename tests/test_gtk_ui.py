@@ -20,14 +20,17 @@ def main():
     assert "PGR_WITH_GTK4" in (ROOT / "main.cpp").read_text(encoding="utf-8")
     gui_source = (ROOT / "gui/gtk_app.hpp").read_text(encoding="utf-8")
     assert "gtk_css_provider" not in gui_source
-    assert "gtk_widget_add_css_class" not in gui_source
     assert "GtkCssProvider" not in gui_source
-    assert 'gtk_application_new("org.pgr.make", G_APPLICATION_NON_UNIQUE)' in gui_source
+    assert 'adw_application_new("org.pgr.make", G_APPLICATION_NON_UNIQUE)' in gui_source
     assert 'gtk_application_new("org.pgr.make", G_APPLICATION_DEFAULT_FLAGS)' not in gui_source
     assert "-DPGR_WITH_GTK4" in gui_source
     assert 'project.exclude("gui/gtk_app.cpp")' in gui_source
     assert 'project.exclude("test")' in gui_source
-    print("[PASS] Default GTK widgets, GTK4 self-build configuration and legacy source filter")
+    for name in ('adw_toolbar_view_new', 'adw_application_window_new',
+                 'gtk_paned_new', 'gtk_source_view_new', 'make_output_panel',
+                 'refresh_explorer', 'make_build_monitor'):
+        assert name in gui_source, name
+    print("[PASS] libadwaita workspace, GTK4 self-build and legacy source filter")
 
     cxx = shutil.which("g++")
     if not cxx:
@@ -52,11 +55,11 @@ def main():
                         "-o", str(windows_macros)], check=True, cwd=ROOT)
         print("[PASS] Windows SDK macro names do not break gcc_t")
         pkg = shutil.which("pkg-config")
-        if not pkg or subprocess.run([pkg, "--exists", "gtk4"]).returncode != 0:
-            print("[SKIP] gtk4 development package not installed")
+        if not pkg or subprocess.run([pkg, "--exists", "gtk4", "libadwaita-1", "gtksourceview-5"]).returncode != 0:
+            print("[SKIP] GTK4/libadwaita/GtkSourceView development SDK not installed")
             return
-        flags = subprocess.check_output([pkg, "--cflags", "gtk4"], text=True).split()
-        libs = subprocess.check_output([pkg, "--libs", "gtk4"], text=True).split()
+        flags = subprocess.check_output([pkg, "--cflags", "gtk4", "libadwaita-1", "gtksourceview-5"], text=True).split()
+        libs = subprocess.check_output([pkg, "--libs", "gtk4", "libadwaita-1", "gtksourceview-5"], text=True).split()
         gui = Path(scratch) / ("pgr_gui.exe" if os.name == "nt" else "pgr_gui")
         subprocess.run([cxx, "-std=c++17", "-Wall", "-Wextra", "-Wpedantic", "-pthread",
                         "-DPGR_WITH_GTK4", *flags, str(ROOT / "main.cpp"),

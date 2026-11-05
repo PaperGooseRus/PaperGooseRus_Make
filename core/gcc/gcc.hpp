@@ -18,6 +18,9 @@
 #include <iomanip>
 #include <sstream>
 #include <set>
+#include <chrono>
+#include "../plan/build_plan.hpp"
+#include "../report/build_report.hpp"
 
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -154,6 +157,28 @@ private:
 
   build_settings_t build_settings;
   std::function<int(const std::string&)> command_executor;
+  build_report_t* active_report = nullptr;     //!< Протокол только текущей сборки.
+  std::string current_reason = "REQUESTED";    //!< Причина запуска текущей операции.
+
+  // Причина инвалидации кэша; порядок проверок важен для диагностики.
+  static std::string rebuild_reason(
+    const std::filesystem::path& command_cache, const std::string& command_signature,
+    const std::filesystem::path& input_cache, const std::string& input_signature,
+    bool output_current, bool analysis_ready = true
+  ) {
+    if (!std::filesystem::is_regular_file(command_cache)) return "FIRST_BUILD";
+    if (!cache_t::cache_matches(command_cache, command_signature)) return "COMMAND_CHANGED";
+    if (input_signature.empty() || !cache_t::cache_matches(input_cache, input_signature))
+      return "INPUTS_CHANGED";
+    if (!output_current) return "OUTPUT_MISSING_OR_STALE";
+    if (!analysis_ready) return "ANALYSIS_MISSING";
+    return "UP_TO_DATE";
+  }
+
+  void skip_step(const char* stage, const std::filesystem::path& source,
+                 const std::filesystem::path& target, const std::string& command) {
+    if (active_report) active_report->add(stage, "SKIPPED", "UP_TO_DATE", source, target, command);
+  }
 
   // Проверка совместимости стандарта и языка.
   static bool is_valid_standart(language_t language, standart_t standart) {
@@ -266,7 +291,21 @@ private:
     std::cout << "[TARGET] -> " << target << std::endl;
     std::cout << "[CMD]    -> " << cmd << std::endl;
 
-    const int error = command_executor ? command_executor(cmd) : process_t::run(cmd);
+    // Снимок входа берём до запуска, длительность измеряем монотонными часами.
+    const auto input = active_report ? cache_t::fingerprint(source) : std::string{};
+    const auto wall_started = active_report ? build_report_t::now_utc() : std::string{};
+    const auto begin = std::chrono::steady_clock::now();
+    int error = 1;
+    try {
+      error = command_executor ? command_executor(cmd) : process_t::run(cmd);
+    } catch (const std::exception& failure) {
+      std::cerr << "ERROR: PROCESS START -> " << failure.what() << '\n';
+      error = 1;
+    }
+    const auto elapsed = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - begin).count();
+    if (active_report) active_report->add(stage, error == 0 ? "EXECUTED" : "FAILED",
+      current_reason, source, target, cmd, elapsed, error, input, wall_started);
     if (error != 0x00) std::cerr << "ERROR: " << stage << " -> " << error << std::endl;
     return error;
   }
@@ -821,8 +860,9 @@ public:
   gcc_step_t current_step(void) const { return gcc_step; }
   gcc_compilation_step_t current_compilation_step(void) const { return gcc_compilation_step; }
 
-  // Инкрементальная сборка проекта, предварительно обработанного project_t.
-  int run(const project_t& project) {
+private:
+  // Реальная сборка; обёртка run() гарантирует сохранение отчёта и при ошибке.
+  int run_body(const project_t& project) {
     gcc_step = gcc_step_t::INACTIVE;
     gcc_compilation_step = gcc_compilation_step_t::INACTIVE;
     validate_settings(build_settings);
@@ -873,15 +913,23 @@ public:
         const bool current = std::filesystem::is_regular_file(output) &&
           (!with_preprocessor || (std::filesystem::is_regular_file(preprocessed) &&
              std::filesystem::is_regular_file(dependencies)));
-        if (current && cache_t::cache_matches(cache, signature) && cache_t::cache_matches(input_cache, inputs)) {
+        const std::string reason = rebuild_reason(cache, signature, input_cache, inputs, current);
+        if (reason == "UP_TO_DATE") {
           std::cout << "[SKIP] UP-TO-DATE -> " << item.path.lexically_relative(project.root()) << '\n';
+          if (with_preprocessor) skip_step("PREPROCESSING", item.path, preprocessed,
+            preprocessing_command(project, item.path, language_t::C, preprocessed, dependencies));
+          skip_step("ASSEMBLY", with_preprocessor ? preprocessed : item.path, output,
+            assembly_command(with_preprocessor ? preprocessed : item.path, output));
           ++skipped_count;
         } else {
-          std::cout << "[BUILD] CHANGED -> " << item.path.lexically_relative(project.root()) << '\n';
+          current_reason = reason;
+          std::cout << "[BUILD] CHANGED -> " << item.path.lexically_relative(project.root())
+                    << " | Reason: " << reason << '\n';
           if (with_preprocessor) {
             if (const int result = preprocessing_assembler(project, item.path, preprocessed, dependencies))
               return result;
           }
+          if (with_preprocessor) current_reason = "PREPROCESSING_UPDATED";
           if (const int result = assembly(with_preprocessor ? preprocessed : item.path, output))
             return result;
           const std::string actual_inputs = with_preprocessor ? cache_t::dependency_fingerprints(dependencies)
@@ -910,14 +958,23 @@ public:
         compilation_command(preprocessed_file, language, compiled_file, report_dir) + "\n" +
         assembly_command(compiled_file, assembled_file) + "\n";
 
-      if (cache_t::cache_matches(cache_file, signature) &&
-          cache_t::cache_matches(input_cache, cache_t::dependency_fingerprints(dependency_file)) &&
-          cache_t::outputs_current(preprocessed_file, compiled_file, assembled_file, dependency_file) &&
-          analysis_current(report_dir, build_settings.analysis)) {
+      const std::string inputs = cache_t::dependency_fingerprints(dependency_file);
+      const std::string reason = rebuild_reason(cache_file, signature, input_cache, inputs,
+        cache_t::outputs_current(preprocessed_file, compiled_file, assembled_file, dependency_file),
+        analysis_current(report_dir, build_settings.analysis));
+      if (reason == "UP_TO_DATE") {
         std::cout << "[SKIP] UP-TO-DATE -> " << item.path.lexically_relative(project.root()) << '\n';
+        skip_step("PREPROCESSING", item.path, preprocessed_file,
+          preprocessing_command(project, item.path, language, preprocessed_file, dependency_file));
+        skip_step("COMPILATION", preprocessed_file, compiled_file,
+          compilation_command(preprocessed_file, language, compiled_file, report_dir));
+        skip_step("ASSEMBLY", compiled_file, assembled_file,
+          assembly_command(compiled_file, assembled_file));
         ++skipped_count;
       } else {
-        std::cout << "[BUILD] CHANGED -> " << item.path.lexically_relative(project.root()) << '\n';
+        current_reason = reason;
+        std::cout << "[BUILD] CHANGED -> " << item.path.lexically_relative(project.root())
+                  << " | Reason: " << reason << '\n';
         int result = preprocessing(project, item.path, language, preprocessed_file, dependency_file);
         if (result != 0x00) return result;
         // Удаляем старые дампы, чтобы не смешивать проходы разных сборок.
@@ -931,8 +988,10 @@ public:
           std::cerr << "ERROR: CANNOT CLEAN ANALYSIS: " << remove_error.message() << '\n';
           return 1;
         }
+        current_reason = "PREPROCESSING_UPDATED";
         result = compilation(preprocessed_file, language, compiled_file, report_dir);
         if (result != 0x00) return result;
+        current_reason = "COMPILATION_UPDATED";
         result = assembly(compiled_file, assembled_file);
         if (result != 0x00) return result;
         if (!std::filesystem::is_regular_file(dependency_file) ||
@@ -996,7 +1055,12 @@ public:
       }
     }
 
+    const std::string link_reason = any_rebuilt ? "OBJECT_UPDATED" :
+      rebuild_reason(link_cache, link_signature, link_inputs_cache, link_inputs(),
+        std::filesystem::is_regular_file(executable_file) &&
+        (!build_settings.binary.linker_map || std::filesystem::is_regular_file(map_file)));
     if (link_needed) {
+      current_reason = link_reason == "UP_TO_DATE" ? "OUTPUT_MISSING_OR_STALE" : link_reason;
       // Не выдаём карту прошлой сборки за новую; старую карту убираем до вызова ld.
       std::error_code map_error;
       if (std::filesystem::is_symlink(map_file, map_error)) {
@@ -1022,14 +1086,51 @@ public:
       }
     } else {
       std::cout << "[LINK] UP-TO-DATE -> " << executable_file << '\n';
+      skip_step("LINKING", object_files.front(), executable_file,
+        linking_command(object_files, executable_file, has_cpp));
     }
 
     // Перекомпиляция не требуется при изменении только параметров анализа Binutils.
     binary_t binary;
     const auto binary_dir = main_dir_to_build / project.name() / binary_dir_to_build;
     const auto binary_cache = main_dir_to_build / project.name() / cache_dir_to_build / "binary.cmd";
+    const auto traced_binary_executor = [this, &executable_file](const std::string& command) {
+      const auto begin = std::chrono::steady_clock::now();
+      const auto started = build_report_t::now_utc();
+      const auto input = cache_t::fingerprint(executable_file);
+      int result = 1;
+      try { result = command_executor ? command_executor(command) : process_t::run(command); }
+      catch (const std::exception& error) {
+        std::cerr << "[BINARY ERROR] " << error.what() << '\n';
+      }
+      const auto milliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - begin).count();
+      std::filesystem::path target;
+      try {
+        const auto parsed = process_t::parse(command);
+        target = parsed.stdout_file;
+        if (target.empty() && parsed.arguments.size() > 1 &&
+            parsed.arguments.front().find("objcopy") != std::string::npos)
+          target = parsed.arguments.back();
+      } catch (const std::exception&) {}
+      if (active_report) active_report->add("BINARY", result == 0 ? "EXECUTED" : "FAILED",
+        "BINARY_REPORT_REQUESTED", executable_file, target, command,
+        milliseconds, result, input, started);
+      return result;
+    };
+    const std::size_t binary_operations_before = active_report ? active_report->operation_count() : 0;
     const int binary_result = binary.run(executable_file, binary_dir, binary_cache,
-      build_settings.binary, command_executor);
+      build_settings.binary, traced_binary_executor);
+    if (active_report && build_settings.binary.reports == false &&
+        !build_settings.binary.generate_bin && !build_settings.binary.generate_hex) {
+      // Постобработка отключена, никаких внешних команд не выполнялось.
+      active_report->add("BINARY", "SKIPPED", "BINARY_ANALYSIS_DISABLED",
+        executable_file, binary_dir, "");
+    } else if (active_report && binary_result == 0 &&
+               binary_operations_before == active_report->operation_count()) {
+      active_report->add("BINARY", "SKIPPED", "BINARY_CACHE_VALID",
+        executable_file, binary_dir, "");
+    }
     if (binary_result != 0) return binary_result;
 
     std::cout << "[SUMMARY] Rebuilt: " << rebuilt_count
@@ -1037,6 +1138,150 @@ public:
               << " | Linking: " << (link_needed ? "YES" : "NO") << '\n';
     std::cout << "GCC BUILD SUCCESS -> " << executable_file << std::endl;
     return 0x00;
+  }
+
+public:
+  // Stage 6: сохраняем отчёт даже после неуспешной компиляции/линковки.
+  int run(const project_t& project) {
+    build_report_t report(project, main_dir_to_build);
+    active_report = &report;
+    const auto finalize = [&](int result) {
+      active_report = nullptr;
+      report.finish(result);
+      // Идентификация toolchain не влияет на код успешной сборки GCC.
+      report.register_tool("gcc", build_settings.gcc_command, true);
+      report.register_tool("g++", build_settings.gpp_command, true);
+      // GNU as/ld обычно вызываются драйвером GCC; фиксируем версии
+      // инструментов выбранного окружения (фактический путь виден в GCC -v).
+      report.register_tool("as", build_settings.binary.toolchain_prefix + "as");
+      report.register_tool("ld", build_settings.binary.toolchain_prefix + "ld");
+      if (build_settings.binary.reports || build_settings.binary.generate_bin ||
+          build_settings.binary.generate_hex) {
+        report.register_tool("objdump", build_settings.binary.toolchain_prefix + "objdump");
+        report.register_tool("objcopy", build_settings.binary.toolchain_prefix + "objcopy");
+      }
+      if (!report.save(project)) {
+        std::cerr << "[REPORT ERROR] Cannot write build report to "
+                  << main_dir_to_build / project.name() << '\n';
+        return result == 0 ? 1 : result;
+      }
+      return result;
+    };
+    try {
+      const auto build = main_dir_to_build / project.name();
+      std::vector<std::pair<std::filesystem::path, std::vector<std::string>>> commands;
+      for (const auto& item : project.sources()) {
+        const auto language = convert_language(item.language);
+        if (language != language_t::C && language != language_t::CPP) continue;
+        const auto& settings = settings_for(language);
+        std::vector<std::string> argv{driver_for(language), "-c"};
+        const auto flags = compiler_flags(settings, true);
+        argv.insert(argv.end(), flags.begin(), flags.end());
+        argv.insert(argv.end(), build_settings.target_flags.begin(), build_settings.target_flags.end());
+        for (const auto& dir : include_directories(project)) argv.push_back("-I" + dir.u8string());
+        argv.push_back(item.path.u8string());
+        argv.push_back("-o");
+        argv.push_back(output_path(project, item.path, assembly_dir_to_build, ".o").u8string());
+        commands.emplace_back(item.path, std::move(argv));
+      }
+      if (!build_report_t::save_compile_commands(project, build, commands))
+        return finalize(1);
+      return finalize(run_body(project));
+    } catch (const std::exception& error) {
+      std::cerr << "[BUILD ERROR] " << error.what() << '\n';
+      return finalize(1);
+    }
+  }
+
+  // Предварительный план: только чтение кэша, без запуска GCC и записи файлов.
+  int preview(const project_t& project, std::ostream& output = std::cout) const {
+    validate_settings(build_settings);
+    if (project.sources().empty()) return 1;
+    build_plan_t plan;
+    std::vector<std::filesystem::path> objects;
+    bool has_cpp = false;
+    bool rebuild = false;
+    for (const auto& item : project.sources()) {
+      const auto language = convert_language(item.language);
+      if (language == language_t::UNKNOWN) return 1;
+      has_cpp = has_cpp || language == language_t::CPP;
+      const auto object = output_path(project, item.path, assembly_dir_to_build, ".o");
+      const auto command_cache = output_path(project, item.path, cache_dir_to_build, ".cmd");
+      const auto input_cache = output_path(project, item.path, cache_dir_to_build, ".inputs");
+      if (language == language_t::ASM || language == language_t::ASM_CPP) {
+        const bool with_cpp = language == language_t::ASM_CPP;
+        const auto preprocessed = output_path(project, item.path, preprocessing_dir_to_build, ".s");
+        const auto depfile = output_path(project, item.path, dependencies_dir_to_build, ".d");
+        const std::string prep_command = with_cpp ?
+          preprocessing_command(project, item.path, language_t::C, preprocessed, depfile) : "";
+        const std::string assembly_cmd = assembly_command(with_cpp ? preprocessed : item.path, object);
+        const auto signature = "PGR-ASM-CACHE-V1\n" +
+          cache_t::tool_fingerprint(build_settings.gcc_command) + "\n" +
+          (with_cpp ? "ASM_CPP\n" : "ASM\n") + assembly_cmd + "\n" + prep_command + "\n";
+        const auto inputs = with_cpp ? cache_t::dependency_fingerprints(depfile) :
+          cache_t::fingerprint(item.path) + "\n";
+        const bool outputs_ok = std::filesystem::is_regular_file(object) &&
+          (!with_cpp || (std::filesystem::is_regular_file(preprocessed) &&
+                         std::filesystem::is_regular_file(depfile)));
+        const auto reason = rebuild_reason(command_cache, signature, input_cache, inputs, outputs_ok);
+        const auto decision = reason == "UP_TO_DATE" ? "SKIP" : "PLAN";
+        if (with_cpp) plan.add("PREPROCESSING", decision, reason, item.path, preprocessed, prep_command);
+        plan.add("ASSEMBLY", decision, reason, with_cpp ? preprocessed : item.path, object, assembly_cmd);
+        rebuild = rebuild || reason != "UP_TO_DATE";
+      } else {
+        const auto preprocessed = output_path(project, item.path, preprocessing_dir_to_build,
+          language == language_t::C ? ".i" : ".ii");
+        const auto compiled = output_path(project, item.path, compilation_dir_to_build, ".s");
+        const auto depfile = output_path(project, item.path, dependencies_dir_to_build, ".d");
+        const auto reports = analysis_path(project, item.path);
+        const auto prep_command = preprocessing_command(project, item.path, language, preprocessed, depfile);
+        const auto comp_command = compilation_command(preprocessed, language, compiled, reports);
+        const auto asm_command = assembly_command(compiled, object);
+        const auto signature = "PGR-OBJECT-CACHE-V2\n" +
+          cache_t::tool_fingerprint(driver_for(language)) + "\n" +
+          cache_t::tool_fingerprint(build_settings.gcc_command) + "\n" +
+          prep_command + "\n" + comp_command + "\n" + asm_command + "\n";
+        const auto reason = rebuild_reason(command_cache, signature, input_cache,
+          cache_t::dependency_fingerprints(depfile),
+          cache_t::outputs_current(preprocessed, compiled, object, depfile),
+          analysis_current(reports, build_settings.analysis));
+        const auto decision = reason == "UP_TO_DATE" ? "SKIP" : "PLAN";
+        plan.add("PREPROCESSING", decision, reason, item.path, preprocessed, prep_command);
+        plan.add("COMPILATION", decision, reason, preprocessed, compiled, comp_command);
+        plan.add("ASSEMBLY", decision, reason, compiled, object, asm_command);
+        rebuild = rebuild || reason != "UP_TO_DATE";
+      }
+      objects.push_back(object);
+    }
+    const auto executable = main_dir_to_build / project.name() / linking_dir_to_build /
+      build_settings.executable_name;
+    const auto cache = main_dir_to_build / project.name() / cache_dir_to_build / "linking.cmd";
+    const auto inputs_cache = main_dir_to_build / project.name() / cache_dir_to_build / "linking.inputs";
+    const auto command = linking_command(objects, executable, has_cpp);
+    std::string inputs = link_input_fingerprints();
+    for (const auto& object : objects) inputs += cache_t::fingerprint(object) + "\n";
+    const auto map_file = executable.parent_path() / (executable.stem().string() + ".map");
+    const bool output_ok = std::filesystem::is_regular_file(executable) &&
+      (!build_settings.binary.linker_map || std::filesystem::is_regular_file(map_file));
+    auto reason = rebuild ? "OBJECT_UPDATED" :
+      rebuild_reason(cache, "PGR-LINK-CACHE-V2\n" + command + "\n",
+        inputs_cache, inputs, output_ok);
+    if (reason == "UP_TO_DATE") {
+      std::error_code error;
+      const auto executable_time = std::filesystem::last_write_time(executable, error);
+      if (error) reason = "OUTPUT_MISSING_OR_STALE";
+      for (const auto& object : objects)
+        if (reason == "UP_TO_DATE" &&
+            (std::filesystem::last_write_time(object, error) > executable_time || error))
+          reason = "OBJECT_NEWER";
+      if (!build_settings.linker_script.empty() && reason == "UP_TO_DATE" &&
+          (std::filesystem::last_write_time(build_settings.linker_script, error) > executable_time || error))
+        reason = "LINKER_SCRIPT_NEWER";
+    }
+    plan.add("LINKING", reason == "UP_TO_DATE" ? "SKIP" : "PLAN",
+      reason, objects.front(), executable, command);
+    plan.print(output);
+    return 0;
   }
 
   // Совместимость с исходным main.cpp из архива.

@@ -1,13 +1,15 @@
 /**
  * @file    gtk_app.hpp
  * @author  Gusev Danil (gusevdanil.work@gmail.com)
- * @brief   Графический интерфейс PaperGooseRus Make на GTK4.
- * @details Header-only интерфейс к существующим project_t, gcc_t, config_t и loger_t.
+ * @brief   Графический интерфейс PaperGooseRus Make на GTK4 и libadwaita.
+ * @details Header-only рабочая среда с проводником, монитором GCC, GtkSourceView
+ *          и постоянным журналом. Использует project_t, gcc_t, config_t, loger_t.
  */
 #ifndef GTK_APP_HPP
 #define GTK_APP_HPP
 
-#include <gtk/gtk.h>
+#include <adwaita.h>
+#include <gtksourceview/gtksource.h>
 
 #include <algorithm>
 #include <atomic>
@@ -16,6 +18,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <map>
+#include <set>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -60,8 +64,29 @@ private:
     GtkWidget* clean_button = nullptr;
     GtkWidget* spinner = nullptr;
     GtkWidget* log_view = nullptr;
+    GtkWidget* plan_view = nullptr;
     GtkWidget* report_view = nullptr;
     GtkWidget* report_choice = nullptr;
+    GtkWidget* toast_overlay = nullptr;
+    GtkWidget* explorer_list = nullptr;
+    GtkWidget* explorer_search = nullptr;
+    GtkWidget* source_preview = nullptr;
+    GtkWidget* source_preview_title = nullptr;
+    GtkWidget* diagnostics_view = nullptr;
+    GtkWidget* build_progress = nullptr;
+    GtkWidget* build_monitor_status = nullptr;
+    GtkWidget* build_monitor_file = nullptr;
+    GtkWidget* build_monitor_summary = nullptr;
+    GtkWidget* stage_labels[4] = {nullptr, nullptr, nullptr, nullptr};
+    std::vector<std::filesystem::path> explorer_entries;
+    std::set<std::filesystem::path> collapsed_folders;
+    std::string pending_log_line;
+    std::size_t diagnostic_errors = 0;
+    std::size_t diagnostic_warnings = 0;
+    std::size_t rebuilt_sources = 0;
+    std::size_t skipped_sources = 0;
+    int last_stage = -1;
+    bool build_log_finished = false;
 
     GtkWidget* c_standard = nullptr;
     GtkWidget* cpp_standard = nullptr;
@@ -135,7 +160,9 @@ private:
     static std::vector<std::string> gtk4_flags(const char* option) {
         gchar* args[] = {const_cast<gchar*>("pkg-config"),
                          const_cast<gchar*>(option),
-                         const_cast<gchar*>("gtk4"), nullptr};
+                         const_cast<gchar*>("gtk4"),
+                         const_cast<gchar*>("libadwaita-1"),
+                         const_cast<gchar*>("gtksourceview-5"), nullptr};
         gchar* output = nullptr;
         gchar* diagnostics = nullptr;
         gint exit_status = -1;
@@ -155,7 +182,7 @@ private:
             if (error) g_error_free(error);
             g_free(output);
             g_free(diagnostics);
-            throw std::runtime_error("GTK4 DEVELOPMENT PACKAGE NOT FOUND: " + reason);
+            throw std::runtime_error("GTK4/LIBADWAITA/GTKSOURCEVIEW DEVELOPMENT PACKAGE NOT FOUND: " + reason);
         }
         gint count = 0;
         gchar** words = nullptr;
@@ -222,7 +249,7 @@ private:
         gcc_t::validate_settings(settings.compiler);
         write_widgets();
         refresh_sources(false);
-        status("GTK4 настроен через pkg-config; сохраните профиль, затем выполните сборку");
+        status("GTK4/libadwaita/GtkSourceView настроены через pkg-config; сохраните профиль, затем выполните сборку");
     }
 
     /** @brief   Получение значения текстового поля. */
@@ -362,6 +389,12 @@ private:
     /** @brief   Показ статуса; вызывается только из потока GTK. */
     void status(const std::string& message) {
         if (status_label) gtk_label_set_text(GTK_LABEL(status_label), message.c_str());
+        if (toast_overlay && (message.find("Ошибка") != std::string::npos ||
+                              message.find("ошибк") != std::string::npos)) {
+            AdwToast* toast = adw_toast_new(message.c_str());
+            adw_toast_set_use_markup(toast, FALSE);
+            adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(toast_overlay), toast);
+        }
     }
 
     std::filesystem::path project_name_path() const {
@@ -544,6 +577,7 @@ private:
         gtk_label_set_text(GTK_LABEL(source_count_label),
             (std::to_string(count) + " исходных файлов (C / C++ / ASM)").c_str());
         refresh_summary(count);
+        refresh_explorer();
     }
 
     void refresh_summary(std::size_t source_count) {
@@ -559,6 +593,7 @@ private:
         if (!std::filesystem::is_directory(path) || path.filename().empty())
             throw std::invalid_argument("INVALID PROJECT DIRECTORY");
         settings.project_path = path;
+        collapsed_folders.clear();
         settings.target_name = "default";
         settings.compiler = gcc_t::build_settings_t{};
         settings.excluded_dirs.clear();
@@ -646,15 +681,128 @@ private:
         g_free(utf8);
     }
 
+    /** @brief   Обновление счётчиков по фактическим строкам журнала GCC. */
+    void process_log_line(const std::string& line) {
+        if (line.find("[GTK4] BUILD START") != std::string::npos) {
+            diagnostic_errors = diagnostic_warnings = 0;
+            rebuilt_sources = skipped_sources = 0;
+            last_stage = -1;
+            build_log_finished = false;
+            if (diagnostics_view) set_text_view(diagnostics_view, "");
+            for (auto*& label : stage_labels)
+                if (label) gtk_label_set_text(GTK_LABEL(label), "Ожидает");
+        }
+        if (line.find("[BUILD] CHANGED") != std::string::npos) ++rebuilt_sources;
+        if (line.find("[SKIP]") != std::string::npos) ++skipped_sources;
+        if (line.find("GCC START PREPROCESSING") != std::string::npos) last_stage = 0;
+        if (line.find("GCC START COMPILATION") != std::string::npos) last_stage = 1;
+        if (line.find("GCC START ASSEMBLY") != std::string::npos) last_stage = 2;
+        if (line.find("GCC START LINKING") != std::string::npos) last_stage = 3;
+        if (last_stage >= 0 && line.find("GCC START") != std::string::npos && stage_labels[last_stage]) {
+            for (int i = 0; i < last_stage; ++i) {
+                if (stage_labels[i]) gtk_label_set_text(GTK_LABEL(stage_labels[i]), "Выполнялось");
+            }
+            gtk_label_set_text(GTK_LABEL(stage_labels[last_stage]), "Выполняется");
+        }
+        if (line.find("[SOURCE]") != std::string::npos && build_monitor_file)
+            gtk_label_set_text(GTK_LABEL(build_monitor_file), line.c_str());
+        const bool is_error = line.find("error:") != std::string::npos ||
+                              line.find("fatal error:") != std::string::npos ||
+                              line.find("ERROR:") != std::string::npos;
+        const bool is_warning = line.find("warning:") != std::string::npos;
+        if (is_error || is_warning) {
+            if (is_error) ++diagnostic_errors;
+            else ++diagnostic_warnings;
+            if (diagnostics_view) {
+                GtkTextBuffer* buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(diagnostics_view));
+                GtkTextIter end;
+                gtk_text_buffer_get_end_iter(buffer, &end);
+                gchar* utf8 = g_utf8_make_valid(line.data(), static_cast<gssize>(line.size()));
+                gtk_text_buffer_insert(buffer, &end, utf8, -1);
+                gtk_text_buffer_insert(buffer, &end, "\n", 1);
+                g_free(utf8);
+            }
+        }
+        if (line.find("[GTK4] BUILD FINISHED") != std::string::npos) {
+            build_log_finished = true;
+            for (auto*& label : stage_labels)
+                if (label && std::string(gtk_label_get_text(GTK_LABEL(label))) == "Выполняется")
+                    gtk_label_set_text(GTK_LABEL(label), "Завершено");
+        }
+        refresh_monitor();
+    }
+
+    /** @brief   Добавление только новых байтов файла в текстовый вывод. */
+    void append_log_text(const std::string& chunk) {
+        GtkTextBuffer* buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(log_view));
+        GtkTextIter end;
+        gtk_text_buffer_get_end_iter(buffer, &end);
+        gchar* utf8 = g_utf8_make_valid(chunk.data(), static_cast<gssize>(chunk.size()));
+        gtk_text_buffer_insert(buffer, &end, utf8, -1);
+        g_free(utf8);
+        // Ограничение объёма видимого журнала при длительной работе программы.
+        const int count = gtk_text_buffer_get_char_count(buffer);
+        if (count > 300000) {
+            GtkTextIter begin, cutoff;
+            gtk_text_buffer_get_start_iter(buffer, &begin);
+            gtk_text_buffer_get_iter_at_offset(buffer, &cutoff, count - 240000);
+            gtk_text_buffer_delete(buffer, &begin, &cutoff);
+        }
+        std::string combined = pending_log_line + chunk;
+        std::size_t offset = 0;
+        for (;;) {
+            const auto newline = combined.find('\n', offset);
+            if (newline == std::string::npos) break;
+            process_log_line(combined.substr(offset, newline - offset));
+            offset = newline + 1;
+        }
+        pending_log_line = combined.substr(offset);
+        if (pending_log_line.size() > 8192) pending_log_line.clear();
+        gtk_text_buffer_get_end_iter(buffer, &end);
+        gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(log_view), &end, 0, FALSE, 0, 0);
+    }
+
+    void refresh_monitor() {
+        if (!build_monitor_summary) return;
+        gtk_label_set_text(GTK_LABEL(build_monitor_summary),
+            ("Пересобрано: " + std::to_string(rebuilt_sources) +
+             "   Пропущено: " + std::to_string(skipped_sources) +
+             "   Ошибки: " + std::to_string(diagnostic_errors) +
+             "   Предупреждения: " + std::to_string(diagnostic_warnings)).c_str());
+        if (build_monitor_status && !building.load() && build_log_finished)
+            gtk_label_set_text(GTK_LABEL(build_monitor_status),
+                build_exit_code.load() == 0 ? "Сборка завершена" : "Ошибка сборки");
+    }
+
     void refresh_log() {
+        if (!log_view) return;
         const auto path = log_path();
         std::error_code error;
         const auto size = std::filesystem::file_size(path, error);
-        const auto actual_size = error ? 0 : size;
+        const std::uintmax_t actual_size = error ? 0 : size;
         if (path == last_log_path && actual_size == last_log_size) return;
+        const bool reload = path != last_log_path ||
+                            last_log_size == static_cast<std::uintmax_t>(-1) ||
+                            actual_size < last_log_size;
+        std::uintmax_t offset = reload ? (actual_size > 256 * 1024 ? actual_size - 256 * 1024 : 0)
+                                       : last_log_size;
+        // Не загружаем произвольное количество байтов при резком росте журнала.
+        if (actual_size > offset + 256 * 1024) offset = actual_size - 256 * 1024;
+        if (reload) {
+            set_text_view(log_view, "");
+            set_text_view(diagnostics_view, "");
+            pending_log_line.clear();
+            diagnostic_errors = diagnostic_warnings = 0;
+            rebuilt_sources = skipped_sources = 0;
+        }
         last_log_path = path;
         last_log_size = actual_size;
-        set_text_view(log_view, read_tail(path));
+        if (!error && actual_size > offset) {
+            std::ifstream input(path, std::ios::binary);
+            input.seekg(static_cast<std::streamoff>(offset));
+            std::string chunk((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            append_log_text(chunk);
+        }
     }
 
     void refresh_report() {
@@ -686,7 +834,9 @@ private:
         gtk_widget_set_sensitive(build_button, FALSE);
         gtk_widget_set_sensitive(clean_button, FALSE);
         gtk_spinner_start(GTK_SPINNER(spinner));
-        gtk_stack_set_visible_child_name(GTK_STACK(stack), "log");
+        if (build_monitor_status) gtk_label_set_text(GTK_LABEL(build_monitor_status), "Сборка выполняется");
+        if (build_progress) gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(build_progress), 0);
+        gtk_stack_set_visible_child_name(GTK_STACK(stack), "monitor");
         status("Сборка выполняется: " + project.name());
         // Только GUI main loop изменяет виджеты. Поток сборки пишет в обычный журнал.
         try {
@@ -723,6 +873,26 @@ private:
         }
     }
 
+    /** @brief   Предварительный план без GCC, создания файлов и изменения кэша. */
+    void preview_build() {
+        if (building.load()) return;
+        const auto old_root = settings.project_path;
+        read_widgets();
+        if (settings.project_path != old_root) refresh_sources(false);
+        project_t project(settings.project_path);
+        prepare_scan(project, settings);
+        if (project.scan() != 0 || project.sources().empty())
+            throw std::runtime_error("NO SOURCE FILES FOR BUILD PLAN");
+        gcc_t gcc;
+        gcc.set_build_dir(settings.build_root);
+        gcc.set_build_settings(settings.compiler);
+        std::ostringstream stream;
+        if (gcc.preview(project, stream) != 0)
+            throw std::runtime_error("BUILD PLAN FAILED");
+        set_text_view(plan_view, stream.str());
+        status("План сборки готов: откройте вкладку «План» в нижней панели");
+    }
+
     /** @brief   Безопасная очистка только известных каталогов выбранной цели. */
     void clean_now() {
         if (building.load()) return;
@@ -754,28 +924,32 @@ private:
     gboolean tick() {
         if (window == nullptr) return G_SOURCE_CONTINUE;
         refresh_log();
+        if (building.load() && build_progress) gtk_progress_bar_pulse(GTK_PROGRESS_BAR(build_progress));
         if (!building.load() && build_worker.joinable()) {
             build_worker.join();
             gtk_spinner_stop(GTK_SPINNER(spinner));
+            if (build_progress) gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(build_progress), 1);
             gtk_widget_set_sensitive(build_button, TRUE);
             gtk_widget_set_sensitive(clean_button, TRUE);
             const int code = build_exit_code.load();
             status(code == 0 ? "Сборка завершена успешно" :
                 "Сборка завершилась с ошибкой (код " + std::to_string(code) + ")");
             refresh_report();
+            refresh_monitor();
         }
         return G_SOURCE_CONTINUE;
     }
 
     /** @brief   Формирование главного окна и страниц. */
+    /** @brief   Главная рабочая область с постоянным проводником и журналом. */
     void create_window() {
-        if (window != nullptr) {
+        if (window) {
             gtk_window_present(GTK_WINDOW(window));
             return;
         }
-        window = gtk_application_window_new(application);
+        window = adw_application_window_new(application);
         gtk_window_set_title(GTK_WINDOW(window), "PaperGooseRus Make");
-        gtk_window_set_default_size(GTK_WINDOW(window), 1250, 820);
+        gtk_window_set_default_size(GTK_WINDOW(window), 1440, 920);
         g_signal_connect(window, "destroy", G_CALLBACK(+[](GtkWidget*, gpointer data) {
             static_cast<gtk_app_t*>(data)->window = nullptr;
         }), this);
@@ -787,47 +961,86 @@ private:
             }
             return FALSE;
         }), this);
-        GtkWidget* vertical = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-        gtk_window_set_child(GTK_WINDOW(window), vertical);
-        GtkWidget* header = gtk_header_bar_new();
-        gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header), title("PGR MAKE"));
-        gtk_window_set_titlebar(GTK_WINDOW(window), header);
+        GtkWidget* toolbar = adw_toolbar_view_new();
+        adw_application_window_set_content(ADW_APPLICATION_WINDOW(window), toolbar);
+        GtkWidget* header = adw_header_bar_new();
+        adw_header_bar_set_title_widget(ADW_HEADER_BAR(header),
+            adw_window_title_new("PGR Make", "GCC build and analysis"));
+        adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar), header);
         spinner = gtk_spinner_new();
-        gtk_header_bar_pack_start(GTK_HEADER_BAR(header), spinner);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), spinner);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header),
+            button("Открыть проект…", G_CALLBACK(on_choose_project), this));
         build_button = button("Собрать", G_CALLBACK(on_build), this);
-        gtk_header_bar_pack_end(GTK_HEADER_BAR(header), build_button);
-        GtkWidget* center = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-        gtk_widget_set_vexpand(center, TRUE);
-        gtk_box_append(GTK_BOX(vertical), center);
+        adw_header_bar_pack_end(ADW_HEADER_BAR(header), build_button);
+        adw_header_bar_pack_end(ADW_HEADER_BAR(header),
+            button("План сборки", G_CALLBACK(on_preview_build), this));
+        adw_header_bar_pack_end(ADW_HEADER_BAR(header),
+            button("Сохранить профиль", G_CALLBACK(on_save_profile), this));
+
+        toast_overlay = adw_toast_overlay_new();
+        adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar), toast_overlay);
+        GtkWidget* body = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+        adw_toast_overlay_set_child(ADW_TOAST_OVERLAY(toast_overlay), body);
+
+        GtkWidget* horizontal = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+        gtk_widget_set_vexpand(horizontal, TRUE);
+        gtk_box_append(GTK_BOX(body), horizontal);
+        GtkWidget* explorer = create_explorer();
+        gtk_paned_set_start_child(GTK_PANED(horizontal), explorer);
+        GtkWidget* workspace = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+        gtk_widget_set_hexpand(workspace, TRUE);
+        gtk_widget_set_vexpand(workspace, TRUE);
+        gtk_paned_set_end_child(GTK_PANED(horizontal), workspace);
+        gtk_paned_set_position(GTK_PANED(horizontal), 285);
+
+        GtkWidget* central = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+        gtk_widget_set_hexpand(central, TRUE);
+        gtk_widget_set_vexpand(central, TRUE);
+        gtk_paned_set_start_child(GTK_PANED(workspace), central);
         stack = gtk_stack_new();
         gtk_stack_set_transition_type(GTK_STACK(stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
         gtk_widget_set_hexpand(stack, TRUE);
         gtk_widget_set_vexpand(stack, TRUE);
-        GtkWidget* sidebar = gtk_stack_sidebar_new();
-        gtk_stack_sidebar_set_stack(GTK_STACK_SIDEBAR(sidebar), GTK_STACK(stack));
-        gtk_widget_set_size_request(sidebar, 210, -1);
-        gtk_box_append(GTK_BOX(center), sidebar);
-        gtk_box_append(GTK_BOX(center), stack);
+        GtkWidget* navigation = gtk_stack_switcher_new();
+        gtk_stack_switcher_set_stack(GTK_STACK_SWITCHER(navigation), GTK_STACK(stack));
+        gtk_widget_set_halign(navigation, GTK_ALIGN_START);
+        gtk_widget_set_margin_top(navigation, 8);
+        gtk_widget_set_margin_bottom(navigation, 8);
+        gtk_widget_set_margin_start(navigation, 12);
+        gtk_box_append(GTK_BOX(central), navigation);
+        gtk_box_append(GTK_BOX(central), stack);
 
         make_overview();
         make_sources();
         make_compiler();
         make_analysis();
         make_embedded();
-        make_log();
+        make_build_monitor();
+        make_source_preview();
         gtk_stack_set_visible_child_name(GTK_STACK(stack), "overview");
 
+        // Постоянный журнал снизу не отнимает рабочую область при смене страниц.
+        GtkWidget* output = make_output_panel();
+        gtk_paned_set_end_child(GTK_PANED(workspace), output);
+        gtk_paned_set_position(GTK_PANED(workspace), 530);
+
         GtkWidget* footer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+        gtk_widget_set_margin_start(footer, 12);
+        gtk_widget_set_margin_end(footer, 12);
+        gtk_widget_set_margin_top(footer, 5);
+        gtk_widget_set_margin_bottom(footer, 5);
         status_label = gtk_label_new("Готов к работе");
-        gtk_widget_set_halign(status_label, GTK_ALIGN_START);
+        gtk_label_set_xalign(GTK_LABEL(status_label), 0);
         gtk_widget_set_hexpand(status_label, TRUE);
         gtk_box_append(GTK_BOX(footer), status_label);
-        gtk_box_append(GTK_BOX(vertical), footer);
+        gtk_box_append(GTK_BOX(body), footer);
+
         write_widgets();
         try { refresh_sources(false); } catch (const std::exception& e) { status(e.what()); }
         refresh_log();
         refresh_report();
-        if (!update_timer) update_timer = g_timeout_add(400, on_timer, this);
+        if (!update_timer) update_timer = g_timeout_add(250, on_timer, this);
         gtk_window_present(GTK_WINDOW(window));
     }
 
@@ -971,7 +1184,8 @@ private:
         report_choice = dropdown(names);
         gtk_box_append(GTK_BOX(reports), report_choice);
         gtk_box_append(GTK_BOX(reports), button("Открыть отчёт", G_CALLBACK(on_refresh_report), this));
-        report_view = gtk_text_view_new();
+        report_view = gtk_source_view_new();
+        gtk_source_view_set_show_line_numbers(GTK_SOURCE_VIEW(report_view), TRUE);
         gtk_text_view_set_editable(GTK_TEXT_VIEW(report_view), FALSE);
         gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(report_view), GTK_WRAP_NONE);
         GtkWidget* scroller = gtk_scrolled_window_new();
@@ -980,23 +1194,249 @@ private:
         gtk_box_append(GTK_BOX(reports), scroller);
     }
 
-    /** @brief   Просмотр общего журнала сборки. */
-    void make_log() {
-        GtkWidget* content = page(stack, "log", "Журнал", "Журнал сборки",
-            "Вывод GCC, GNU Binutils и диагностика. В процессе сборки обновляется автоматически.");
-        GtkWidget* controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-        gtk_box_append(GTK_BOX(content), controls);
-        gtk_box_append(GTK_BOX(controls), button("Обновить журнал", G_CALLBACK(on_refresh_log), this));
-        gtk_box_append(GTK_BOX(controls), button("Открыть результаты", G_CALLBACK(on_open_output), this));
+    /** @brief   Проводник файлов проекта (не зависит от набора целей сборки). */
+    GtkWidget* create_explorer() {
+        GtkWidget* sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+        gtk_widget_set_size_request(sidebar, 200, -1);
+        gtk_widget_set_margin_top(sidebar, 12);
+        gtk_widget_set_margin_start(sidebar, 10);
+        gtk_widget_set_margin_end(sidebar, 10);
+        GtkWidget* heading = title("ПРОВОДНИК ПРОЕКТА");
+        gtk_box_append(GTK_BOX(sidebar), heading);
+        explorer_search = gtk_search_entry_new();
+#if GTK_CHECK_VERSION(4, 10, 0)
+        gtk_search_entry_set_placeholder_text(GTK_SEARCH_ENTRY(explorer_search), "Найти файл…");
+#endif
+        g_signal_connect(explorer_search, "search-changed", G_CALLBACK(on_explorer_search), this);
+        gtk_box_append(GTK_BOX(sidebar), explorer_search);
+        GtkWidget* scroll = gtk_scrolled_window_new();
+        gtk_widget_set_vexpand(scroll, TRUE);
+        gtk_box_append(GTK_BOX(sidebar), scroll);
+        explorer_list = gtk_list_box_new();
+        gtk_list_box_set_selection_mode(GTK_LIST_BOX(explorer_list), GTK_SELECTION_SINGLE);
+        g_signal_connect(explorer_list, "row-activated", G_CALLBACK(on_explorer_open), this);
+        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), explorer_list);
+        gtk_box_append(GTK_BOX(sidebar),
+            button("Обновить файлы", G_CALLBACK(on_refresh_sources), this));
+        return sidebar;
+    }
+
+    /** @brief   Перестройка проводника с ограничением на число элементов. */
+    void refresh_explorer() {
+        if (!explorer_list) return;
+        while (GtkWidget* row = gtk_widget_get_first_child(explorer_list))
+            gtk_list_box_remove(GTK_LIST_BOX(explorer_list), row);
+        explorer_entries.clear();
+        std::error_code error;
+        if (!std::filesystem::is_directory(settings.project_path, error)) return;
+        const std::string filter = explorer_search ? text_of(explorer_search) : "";
+        std::vector<std::filesystem::path> entries;
+        std::filesystem::recursive_directory_iterator iter(settings.project_path,
+            std::filesystem::directory_options::skip_permission_denied, error), end;
+        while (!error && iter != end && entries.size() < 1200) {
+            const auto relative = iter->path().lexically_relative(settings.project_path);
+            const std::string filename = iter->path().filename().string();
+            if (iter->is_directory(error)) {
+                if (filename == ".git" || filename == "build" || filename == ".pgr" ||
+                    filename == "node_modules" || filename == ".vscode") {
+                    iter.disable_recursion_pending();
+                } else if (relative.begin() != relative.end()) {
+                    entries.push_back(relative);
+                }
+            } else if (!error && iter->is_regular_file(error)) {
+                const std::string extension = iter->path().extension().string();
+                if (extension == ".c" || extension == ".cpp" || extension == ".h" ||
+                    extension == ".hpp" || extension == ".s" || extension == ".S" ||
+                    extension == ".ld" || extension == ".cfg" || extension == ".md" ||
+                    extension == ".json" || extension == ".txt")
+                    entries.push_back(relative);
+            }
+            if (error) break;
+            iter.increment(error);
+        }
+        std::sort(entries.begin(), entries.end());
+        for (const auto& relative : entries) {
+            const std::string full = relative.generic_string();
+            if (!filter.empty() && full.find(filter) == std::string::npos) continue;
+            if (filter.empty()) {
+                // Скрываем содержимое свёрнутых родительских каталогов.
+                bool hidden = false;
+                auto parent = relative.parent_path();
+                while (!parent.empty()) {
+                    if (collapsed_folders.count(parent)) { hidden = true; break; }
+                    parent = parent.parent_path();
+                }
+                if (hidden) continue;
+            }
+            const bool directory = std::filesystem::is_directory(settings.project_path / relative, error);
+            const int depth = static_cast<int>(std::distance(relative.begin(), relative.end())) - 1;
+            GtkWidget* item = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+            gtk_widget_set_margin_start(item, std::min(depth, 8) * 13 + 5);
+            GtkWidget* icon = gtk_image_new_from_icon_name(directory ? "folder-symbolic" : "text-x-generic-symbolic");
+            gtk_box_append(GTK_BOX(item), icon);
+            const std::string label = directory ?
+                (collapsed_folders.count(relative) ? "▶ " : "▼ ") + relative.filename().string() :
+                relative.filename().string();
+            GtkWidget* text = gtk_label_new(label.c_str());
+            gtk_label_set_xalign(GTK_LABEL(text), 0);
+            gtk_label_set_ellipsize(GTK_LABEL(text), PANGO_ELLIPSIZE_END);
+            gtk_widget_set_hexpand(text, TRUE);
+            gtk_box_append(GTK_BOX(item), text);
+            GtkWidget* row = gtk_list_box_row_new();
+            gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), item);
+            gtk_list_box_append(GTK_LIST_BOX(explorer_list), row);
+            explorer_entries.push_back(relative);
+        }
+    }
+
+    static void on_explorer_search(GtkSearchEntry*, gpointer data) {
+        auto* self = static_cast<gtk_app_t*>(data);
+        try { self->refresh_explorer(); }
+        catch (const std::exception& error) { self->status(error.what()); }
+    }
+
+    static void on_explorer_open(GtkListBox*, GtkListBoxRow* row, gpointer data) {
+        auto* self = static_cast<gtk_app_t*>(data);
+        const int index = gtk_list_box_row_get_index(row);
+        if (index < 0 || static_cast<std::size_t>(index) >= self->explorer_entries.size()) return;
+        const auto relative = self->explorer_entries[static_cast<std::size_t>(index)];
+        try {
+            if (std::filesystem::is_directory(self->settings.project_path / relative)) {
+                if (!self->collapsed_folders.erase(relative)) self->collapsed_folders.insert(relative);
+                self->refresh_explorer();
+            } else {
+                self->open_source(relative);
+            }
+        } catch (const std::exception& error) { self->status(error.what()); }
+    }
+
+    /** @brief   Чтение начала исходного файла без загрузки большого файла целиком. */
+    static std::string read_source_head(const std::filesystem::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) throw std::runtime_error("CANNOT OPEN SOURCE FILE: " + path.string());
+        constexpr std::size_t limit = 512 * 1024;
+        std::string content(limit, '\0');
+        input.read(content.data(), static_cast<std::streamsize>(limit));
+        content.resize(static_cast<std::size_t>(input.gcount()));
+        if (input.peek() != std::char_traits<char>::eof())
+            content += "\n[Показано начало файла; содержимое усечено]\n";
+        return content;
+    }
+
+    /** @brief   Просмотр исходника с подсветкой и нумерацией строк GtkSourceView. */
+    void make_source_preview() {
+        GtkWidget* content = page(stack, "source-preview", "Код", "Просмотр исходного файла",
+            "Файл выбирается в проводнике слева. Просмотр не изменяет исходный код.");
+        source_preview_title = title("Выберите файл в проводнике проекта");
+        gtk_box_append(GTK_BOX(content), source_preview_title);
+        source_preview = gtk_source_view_new();
+        gtk_text_view_set_editable(GTK_TEXT_VIEW(source_preview), FALSE);
+        gtk_source_view_set_show_line_numbers(GTK_SOURCE_VIEW(source_preview), TRUE);
+        gtk_source_view_set_highlight_current_line(GTK_SOURCE_VIEW(source_preview), TRUE);
+        GtkWidget* scroll = gtk_scrolled_window_new();
+        gtk_widget_set_vexpand(scroll, TRUE);
+        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), source_preview);
+        gtk_box_append(GTK_BOX(content), scroll);
+    }
+
+    void open_source(const std::filesystem::path& relative) {
+        const auto file = std::filesystem::weakly_canonical(settings.project_path / relative);
+        const auto check = file.lexically_relative(settings.project_path);
+        if (check.empty() || *check.begin() == ".." ||
+            !std::filesystem::is_regular_file(file))
+            throw std::runtime_error("SOURCE FILE OUTSIDE PROJECT");
+        gtk_label_set_text(GTK_LABEL(source_preview_title), relative.generic_string().c_str());
+        set_text_view(source_preview, read_source_head(file));
+        GtkSourceLanguageManager* manager = gtk_source_language_manager_get_default();
+        GtkSourceLanguage* language = gtk_source_language_manager_guess_language(
+            manager, file.filename().string().c_str(), nullptr);
+        GtkTextBuffer* buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(source_preview));
+        gtk_source_buffer_set_language(GTK_SOURCE_BUFFER(buffer), language);
+        gtk_stack_set_visible_child_name(GTK_STACK(stack), "source-preview");
+    }
+
+    /** @brief   Монитор четырёх независимых этапов GCC. */
+    void make_build_monitor() {
+        GtkWidget* content = page(stack, "monitor", "Сборка", "Монитор GCC",
+            "Статусы отображаются по строкам реального журнала. Индикатор пульсирует пока процесс работает.");
+        build_monitor_status = title("Готов к сборке");
+        gtk_box_append(GTK_BOX(content), build_monitor_status);
+        build_progress = gtk_progress_bar_new();
+        gtk_box_append(GTK_BOX(content), build_progress);
+        static const char* stage_names[] = {"Препроцессирование", "Компиляция", "Ассемблирование", "Компоновка"};
+        for (int i = 0; i < 4; ++i) {
+            GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+            GtkWidget* label = title(stage_names[i]);
+            gtk_widget_set_size_request(label, 210, -1);
+            gtk_box_append(GTK_BOX(row), label);
+            stage_labels[i] = title("Ожидает");
+            gtk_box_append(GTK_BOX(row), stage_labels[i]);
+            gtk_box_append(GTK_BOX(content), row);
+        }
+        build_monitor_file = title("Текущий файл: —");
+        gtk_box_append(GTK_BOX(content), build_monitor_file);
+        build_monitor_summary = title("Нет данных о сборке");
+        gtk_box_append(GTK_BOX(content), build_monitor_summary);
+        gtk_box_append(GTK_BOX(content),
+            button("Открыть результаты", G_CALLBACK(on_open_output), this));
+    }
+
+    /** @brief   Нижняя область вывода: поток GCC и отдельная диагностика. */
+    GtkWidget* make_output_panel() {
+        GtkWidget* notebook = gtk_notebook_new();
+        gtk_widget_set_size_request(notebook, -1, 155);
         log_view = gtk_text_view_new();
         gtk_text_view_set_editable(GTK_TEXT_VIEW(log_view), FALSE);
         gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(log_view), FALSE);
         gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(log_view), GTK_WRAP_NONE);
-        GtkWidget* scroller = gtk_scrolled_window_new();
-        gtk_widget_set_vexpand(scroller, TRUE);
-        gtk_widget_set_size_request(scroller, -1, 480);
-        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), log_view);
-        gtk_box_append(GTK_BOX(content), scroller);
+        GtkWidget* log_scroll = gtk_scrolled_window_new();
+        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(log_scroll), log_view);
+        gtk_notebook_append_page(GTK_NOTEBOOK(notebook), log_scroll, gtk_label_new("Вывод сборки"));
+        diagnostics_view = gtk_text_view_new();
+        gtk_text_view_set_editable(GTK_TEXT_VIEW(diagnostics_view), FALSE);
+        gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(diagnostics_view), GTK_WRAP_WORD_CHAR);
+        GtkWidget* diag_scroll = gtk_scrolled_window_new();
+        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(diag_scroll), diagnostics_view);
+        gtk_notebook_append_page(GTK_NOTEBOOK(notebook), diag_scroll, gtk_label_new("Ошибки и предупреждения"));
+        plan_view = gtk_text_view_new();
+        gtk_text_view_set_editable(GTK_TEXT_VIEW(plan_view), FALSE);
+        gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(plan_view), FALSE);
+        gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(plan_view), GTK_WRAP_NONE);
+        GtkWidget* plan_scroll = gtk_scrolled_window_new();
+        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(plan_scroll), plan_view);
+        gtk_notebook_append_page(GTK_NOTEBOOK(notebook), plan_scroll, gtk_label_new("План"));
+        GtkWidget* controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_box_append(GTK_BOX(controls), button("Обновить", G_CALLBACK(on_refresh_log), this));
+        gtk_box_append(GTK_BOX(controls), button("Каталог сборки", G_CALLBACK(on_open_output), this));
+        gtk_box_append(GTK_BOX(controls), button("Windows Terminal", G_CALLBACK(on_external_terminal), this));
+        GtkWidget* output = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+        gtk_box_append(GTK_BOX(output), controls);
+        gtk_widget_set_vexpand(notebook, TRUE);
+        gtk_box_append(GTK_BOX(output), notebook);
+        return output;
+    }
+
+    /** @brief   Открывает внешнюю оболочку, не имитируя встроенный PTY. */
+    void external_terminal() {
+#ifdef _WIN32
+        const std::string root = settings.project_path.string();
+        gchar* argv[] = {const_cast<gchar*>("wt.exe"), const_cast<gchar*>("-d"),
+                         const_cast<gchar*>(root.c_str()), nullptr};
+#else
+        const std::string root = "--working-directory=" + settings.project_path.string();
+        gchar* argv[] = {const_cast<gchar*>("gnome-terminal"),
+                         const_cast<gchar*>(root.c_str()), nullptr};
+#endif
+        GError* error = nullptr;
+        if (!g_spawn_async(nullptr, argv, nullptr, G_SPAWN_SEARCH_PATH,
+                           nullptr, nullptr, nullptr, &error)) {
+            const std::string message = error ? error->message : "TERMINAL START FAILED";
+            if (error) g_error_free(error);
+            throw std::runtime_error("TERMINAL START FAILED: " + message);
+        }
+    }
+    static void on_external_terminal(GtkButton*, gpointer data) {
+        invoke(data, &gtk_app_t::external_terminal);
     }
 
     /** @brief   Единая обработка исключений GTK callbacks. */
@@ -1008,6 +1448,7 @@ private:
     }
 
     static void on_build(GtkButton*, gpointer data) { invoke(data, &gtk_app_t::start_build); }
+    static void on_preview_build(GtkButton*, gpointer data) { invoke(data, &gtk_app_t::preview_build); }
     static void on_configure_gtk4(GtkButton*, gpointer data) {
         invoke(data, &gtk_app_t::configure_gtk4_self_build);
     }
@@ -1145,6 +1586,8 @@ private:
 
     /** @brief   Callback-функция активации приложения. */
     static void activate(GtkApplication*, gpointer data) {
+        // GtkSourceView требует явной инициализации после запуска GTK.
+        gtk_source_init();
         static_cast<gtk_app_t*>(data)->create_window();
     }
 
@@ -1162,7 +1605,7 @@ public:
         // Локальное приложение не использует регистрацию единственного экземпляра.
         // G_APPLICATION_NON_UNIQUE исключает ожидание регистрации через session bus,
         // которое в некоторых конфигурациях Windows/MSYS2 завершается тайм-аутом.
-        application = gtk_application_new("org.pgr.make", G_APPLICATION_NON_UNIQUE);
+        application = GTK_APPLICATION(adw_application_new("org.pgr.make", G_APPLICATION_NON_UNIQUE));
         if (!application) throw std::runtime_error("GTK4 APPLICATION INITIALIZATION FAILED");
         g_signal_connect(application, "activate", G_CALLBACK(activate), this);
     }

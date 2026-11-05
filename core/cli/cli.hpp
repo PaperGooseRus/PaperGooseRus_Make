@@ -36,6 +36,7 @@ public:
 private:
   settings_t settings;
   build_callback_t build_callback;
+  build_callback_t preview_callback;
 
   // Чтение команды целиком, включая пути с пробелами.
   static std::string read_line(const std::string& prompt) {
@@ -122,6 +123,7 @@ private:
               << " 11. Executable / Embedded analysis\n"
               << " 12. Build targets / profiles\n"
               << " 13. Select target source files\n"
+              << " 14. Preview build plan (dry run)\n"
               << "  0. Exit\n"
               << "----------------------------------------------\n";
   }
@@ -189,6 +191,21 @@ private:
     } catch (const std::exception& error) {
       std::cerr << "[ERROR] " << error.what() << '\n';
       return 1;
+    }
+  }
+
+  // Предварительный просмотр не создаёт выходных файлов и не запускает компилятор.
+  void preview_build() const {
+    project_t project(settings.project_path);
+    if (!scan(project) || project.sources().empty()) {
+      std::cerr << "[PLAN ERROR] No sources to analyze.\n";
+      return;
+    }
+    try {
+      if (preview_callback) preview_callback(project, settings.build_root, settings.compiler);
+      else std::cout << "[PLAN ERROR] Preview callback is not configured.\n";
+    } catch (const std::exception& error) {
+      std::cerr << "[PLAN ERROR] " << error.what() << '\n';
     }
   }
 
@@ -880,8 +897,10 @@ private:
   }
 
 public:
-  explicit cli_t(build_callback_t callback, settings_t initial)
-    : settings(std::move(initial)), build_callback(std::move(callback)) {
+  explicit cli_t(build_callback_t callback, settings_t initial,
+                 build_callback_t preview = {})
+    : settings(std::move(initial)), build_callback(std::move(callback)),
+      preview_callback(std::move(preview)) {
     std::error_code error;
     const auto path = std::filesystem::absolute(settings.project_path, error);
     if (!error) {
@@ -917,6 +936,7 @@ public:
       else if (command == "11" || command == "embedded" || command == "binary") configure_embedded();
       else if (command == "12" || command == "targets") targets();
       else if (command == "13" || command == "select") choose_sources();
+      else if (command == "14" || command == "plan" || command == "dry-run") preview_build();
       else if (!command.empty()) std::cout << "[ERROR] Unknown command. Use 8 for help.\n";
     }
     std::cout << "PGR MAKE: exit (last build status: " << last_build_status << ").\n";
