@@ -1,1 +1,6 @@
+build/main.exe
+
+# Local build outputs and temporary test artifacts.
 build/
+C:/
+__pycache__/
